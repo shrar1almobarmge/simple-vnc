@@ -1,0 +1,98 @@
+{
+ "version": 1,
+ "values": [
+  {
+   "name": "default port",
+   "group": "connection",
+   "value": 5900,
+   "estimated": true
+  },
+  {
+   "name": "display number offset",
+   "group": "connection",
+   "value": 5900,
+   "estimated": true
+  },
+  {
+   "name": "protocol version",
+   "group": "connection",
+   "value": "RFB 3.8 (falls back to 3.7 / 3.3)",
+   "estimated": true
+  },
+  {
+   "name": "password method",
+   "group": "connection",
+   "value": "none (open login)",
+   "estimated": true
+  },
+  {
+   "name": "colour depth",
+   "group": "picture",
+   "value": 32,
+   "unit": "bits",
+   "estimated": true
+  },
+  {
+   "name": "picture types",
+   "group": "picture",
+   "value": "Raw, CopyRect, DesktopSize",
+   "estimated": true
+  },
+  {
+   "name": "mouse left button",
+   "group": "controls",
+   "value": 1,
+   "estimated": true
+  },
+  {
+   "name": "mouse middle button",
+   "group": "controls",
+   "value": 2,
+   "estimated": true
+  },
+  {
+   "name": "mouse right button",
+   "group": "controls",
+   "value": 4,
+   "estimated": true
+  },
+  {
+   "name": "wheel up",
+   "group": "controls",
+   "value": 8,
+   "estimated": true
+  },
+  {
+   "name": "wheel down",
+   "group": "controls",
+   "value": 16,
+   "estimated": true
+  },
+  {
+   "name": "connect timeout",
+   "group": "connection",
+   "value": 8,
+   "unit": "s",
+   "estimated": true
+  },
+  {
+   "name": "server port",
+   "group": "server",
+   "value": 5900,
+   "estimated": true
+  },
+  {
+   "name": "server picture type",
+   "group": "server",
+   "value": "Raw (changed rows only)",
+   "estimated": true
+  },
+  {
+   "name": "server update interval",
+   "group": "server",
+   "value": 30,
+   "unit": "ms",
+   "estimated": true
+  }
+ ]
+}
