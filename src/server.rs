@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, FontId, RichText, TextStyle};
 
 // ---------------------------------------------------------------- shared state
 
@@ -477,6 +476,8 @@ fn client(mut s: TcpStream, sh: &Arc<Shared>) -> io::Result<()> {
     init.extend_from_slice(name);
     s.write_all(&init)?;
     s.set_read_timeout(None)?;
+    let who = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    println!("Connected: {}", who);
 
     let cs = Arc::new(Mutex::new(ClientState {
         fmt: DEFAULT_FMT,
@@ -551,6 +552,7 @@ fn client(mut s: TcpStream, sh: &Arc<Shared>) -> io::Result<()> {
     })();
     alive.store(false, Ordering::SeqCst);
     let _ = s.shutdown(Shutdown::Both);
+    println!("Disconnected: {}", who);
     result
 }
 
@@ -588,7 +590,7 @@ fn serve(sh: Arc<Shared>) {
     }
 }
 
-// ---------------------------------------------------------------- the window
+// ---------------------------------------------------------------- the terminal
 
 fn local_ip() -> String {
     let find = || -> Option<String> {
@@ -599,183 +601,26 @@ fn local_ip() -> String {
     find().unwrap_or_else(|| "not connected to a network".to_string())
 }
 
-struct App {
-    shared: Arc<Shared>,
-    ip: String,
-    shot: Option<String>,
-    frames: u32,
-}
-
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>, shot: Option<String>) -> Self {
-        cc.egui_ctx.style_mut(|s| {
-            s.text_styles
-                .insert(TextStyle::Body, FontId::proportional(18.0));
-            s.text_styles
-                .insert(TextStyle::Button, FontId::proportional(18.0));
-            s.text_styles
-                .insert(TextStyle::Heading, FontId::proportional(34.0));
-            s.spacing.item_spacing = egui::vec2(10.0, 12.0);
-        });
-        let shared = Arc::new(Shared {
-            running: AtomicBool::new(true),
-            viewers: AtomicUsize::new(0),
-            error: Mutex::new(String::new()),
-        });
-        let sh = shared.clone();
-        std::thread::spawn(move || serve(sh));
-        App {
-            shared,
-            ip: local_ip(),
-            shot,
-            frames: 0,
-        }
-    }
-
-    fn toggle(&mut self) {
-        if self.shared.running.load(Ordering::SeqCst) {
-            self.shared.running.store(false, Ordering::SeqCst);
-        } else {
-            self.shared.error.lock().unwrap().clear();
-            self.shared.running.store(true, Ordering::SeqCst);
-            let sh = self.shared.clone();
-            std::thread::spawn(move || serve(sh));
-        }
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.frames += 1;
-        ctx.request_repaint_after(Duration::from_millis(500));
-        let running = self.shared.running.load(Ordering::SeqCst);
-        let viewers = self.shared.viewers.load(Ordering::SeqCst);
-        let error = self.shared.error.lock().unwrap().clone();
-        let mut toggle = false;
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(26.0);
-                ui.heading("Simple VNC Server");
-                ui.label(
-                    RichText::new("Lets another computer see and control this one.")
-                        .color(Color32::from_gray(170)),
-                );
-                ui.add_space(14.0);
-
-                let (text, color) = if running {
-                    ("Sharing is ON", Color32::from_rgb(70, 200, 110))
-                } else {
-                    ("Sharing is OFF", Color32::from_gray(150))
-                };
-                ui.label(RichText::new(text).size(28.0).strong().color(color));
-                if running {
-                    ui.label(if viewers == 0 {
-                        "Waiting for the other computer...".to_string()
-                    } else {
-                        format!("{} computer(s) connected right now", viewers)
-                    });
-                }
-                ui.add_space(6.0);
-
-                egui::Frame::none()
-                    .fill(Color32::from_gray(36))
-                    .rounding(8.0)
-                    .inner_margin(14.0)
-                    .show(ui, |ui| {
-                        ui.set_width(340.0);
-                        ui.label(RichText::new("This computer's address").color(Color32::from_gray(170)));
-                        let port = PORT.load(Ordering::SeqCst);
-                        let shown = if port == 5900 { self.ip.clone() } else { format!("{}:{}", self.ip, port) };
-                        ui.label(RichText::new(shown).size(26.0).monospace());
-                    });
-
-                ui.add_space(4.0);
-                let label = if running { "Stop sharing" } else { "Start sharing" };
-                if ui
-                    .add_sized([340.0, 48.0], egui::Button::new(RichText::new(label).size(22.0)))
-                    .clicked()
-                {
-                    toggle = true;
-                }
-                if !error.is_empty() {
-                    ui.label(RichText::new(&error).color(Color32::from_rgb(255, 120, 110)));
-                }
-
-                ui.add_space(10.0);
-                egui::Frame::none()
-                    .fill(Color32::from_gray(36))
-                    .rounding(8.0)
-                    .inner_margin(14.0)
-                    .show(ui, |ui| {
-                        ui.set_width(340.0);
-                        ui.label(RichText::new("How it works").strong());
-                        let dim = Color32::from_gray(185);
-                        ui.label(RichText::new("1. Keep this window open. Sharing starts by itself.").color(dim));
-                        ui.label(RichText::new("2. On the other computer, open Simple VNC Viewer. It finds this computer by itself and connects.").color(dim));
-                        ui.label(RichText::new("3. If Windows asks about the firewall, press Allow.").color(dim));
-                    });
-            });
-        });
-
-        if toggle {
-            self.toggle();
-        }
-        if let Some(path) = self.shot.clone() {
-            ctx.request_repaint();
-            if self.frames == 120 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-            }
-            let img = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                    _ => None,
-                })
-            });
-            if let Some(img) = img {
-                let [w, h] = img.size;
-                let mut buf = Vec::with_capacity(w * h * 4);
-                for p in &img.pixels {
-                    buf.extend_from_slice(&p.to_array());
-                }
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let ok = image::save_buffer(&path, &buf, w as u32, h as u32, image::ColorType::Rgba8)
-                    .is_ok();
-                std::process::exit(if ok { 0 } else { 1 });
-            }
-            if self.frames > 900 {
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
 const HELP: &str = "Simple VNC Server
 
 Usage:
-  simple-vnc-server                 open the window and start sharing this screen
+  simple-vnc-server                 start sharing this screen
   simple-vnc-server --port 5901     share on another port (default 5900)
-  simple-vnc-server --minimized     start with the window minimized
   simple-vnc-server --help          show this help
-  simple-vnc-server --screenshot f.png   save a picture of the window and exit
+
+Press Ctrl+C to stop sharing.
 ";
 
-fn main() -> eframe::Result<()> {
+fn main() {
     win::make_dpi_aware();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h" || a == "/?") {
         print!("{}", HELP);
-        return Ok(());
+        return;
     }
-    let mut shot = None;
-    let mut minimized = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--screenshot" => shot = it.next().cloned(),
-            "--minimized" => minimized = true,
             "--port" => match it.next().and_then(|v| v.parse::<u16>().ok()).filter(|p| *p > 0) {
                 Some(p) => PORT.store(p, Ordering::SeqCst),
                 None => {
@@ -789,22 +634,22 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 800.0])
-            .with_min_inner_size([420.0, 640.0])
-            .with_title("Simple VNC Server"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Simple VNC Server",
-        options,
-        Box::new(move |cc| {
-            if minimized {
-                cc.egui_ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            Ok(Box::new(App::new(cc, shot)))
-        }),
-    )
+
+    let shared = Arc::new(Shared {
+        running: AtomicBool::new(true),
+        viewers: AtomicUsize::new(0),
+        error: Mutex::new(String::new()),
+    });
+    let port = PORT.load(Ordering::SeqCst);
+    let ip = local_ip();
+    let shown = if port == 5900 { ip } else { format!("{}:{}", ip, port) };
+    println!("Simple VNC Server");
+    println!("Sharing is ON. This computer's address: {}", shown);
+    println!("Waiting for connection... (press Ctrl+C to stop)");
+    serve(shared.clone());
+    let error = shared.error.lock().unwrap().clone();
+    if !error.is_empty() {
+        eprintln!("{}", error);
+        std::process::exit(1);
+    }
 }

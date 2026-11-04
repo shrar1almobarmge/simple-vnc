@@ -21,7 +21,7 @@ irm https://github.com/shrar1almobarmge/simple-vnc/releases/latest/download/simp
 
 ## Options
 
-- Server: `simple-vnc-server [--port N] [--minimized] [--help]`
+- Server: `simple-vnc-server [--port N] [--help]` — runs in the terminal, prints `Connected: <ip>` when a viewer joins. Press Ctrl+C to stop.
 - Viewer: `simple-vnc-viewer [address[:port]] [--help]`
 
 ## Build from source
