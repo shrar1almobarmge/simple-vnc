@@ -645,6 +645,13 @@ fn main() {
     let shown = if port == 5900 { ip } else { format!("{}:{}", ip, port) };
     println!("Simple VNC Server");
     println!("Sharing is ON. This computer's address: {}", shown);
+    println!();
+    println!("Other computer can't find this one? Run this once in PowerShell and press Yes:");
+    println!(
+        "  Start-Process powershell -Verb RunAs -ArgumentList '-Command New-NetFirewallRule -DisplayName ''Simple VNC Server {0}'' -Direction Inbound -Protocol TCP -LocalPort {0} -Action Allow -Profile Any'",
+        port
+    );
+    println!();
     println!("Waiting for connection... (press Ctrl+C to stop)");
     serve(shared.clone());
     let error = shared.error.lock().unwrap().clone();
