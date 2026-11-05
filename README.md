@@ -13,6 +13,14 @@ A very simple VNC server and viewer for Windows, written in Rust.
 irm https://github.com/shrar1almobarmge/simple-vnc/releases/latest/download/simple-vnc-server.exe -OutFile simple-vnc-server.exe; .\simple-vnc-server.exe
 ```
 
+## Start with Windows, also before login
+
+```powershell
+.\simple-vnc-server.exe --install
+```
+
+Windows asks for permission (press Yes). The server is copied to `C:\Program Files\Simple VNC`, runs as a background service, opens its port in the firewall, and also shows the lock screen. To remove it: `.\simple-vnc-server.exe --uninstall`.
+
 ## Install the viewer (PowerShell)
 
 ```powershell

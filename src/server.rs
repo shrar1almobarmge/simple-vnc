@@ -76,14 +76,57 @@ mod win {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HWND};
     use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::System::StationsAndDesktops::*;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     pub fn make_dpi_aware() {
         unsafe {
             SetProcessDPIAware();
+        }
+    }
+
+    thread_local! {
+        static DESK: std::cell::Cell<(HDESK, [u16; 64])> = const { std::cell::Cell::new((null_mut(), [0; 64])) };
+    }
+
+    // Moves this thread onto the desktop that is on screen now (normal desktop, lock screen,
+    // or the "Do you want to allow" prompt). Only works when running as SYSTEM (the service);
+    // otherwise nothing changes. Returns true when the thread moved.
+    pub fn follow_input_desktop() -> bool {
+        unsafe {
+            let h = OpenInputDesktop(0, 0, GENERIC_ALL);
+            if h.is_null() {
+                return false;
+            }
+            let mut name = [0u16; 64];
+            let mut need = 0u32;
+            GetUserObjectInformationW(h as _, UOI_NAME, name.as_mut_ptr() as _, 128, &mut need);
+            let (old, old_name) = DESK.with(|d| d.get());
+            if name == old_name || SetThreadDesktop(h) == 0 {
+                CloseDesktop(h);
+                return false;
+            }
+            if !old.is_null() {
+                CloseDesktop(old);
+            }
+            DESK.with(|d| d.set((h, name)));
+            true
+        }
+    }
+
+    // Asks the service to press the real Ctrl+Alt+Del (programs are not allowed to fake it).
+    pub fn request_ctrl_alt_del() {
+        unsafe {
+            let name: Vec<u16> = "Global\\SimpleVncSAS\0".encode_utf16().collect();
+            let ev = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+            if !ev.is_null() {
+                SetEvent(ev);
+                CloseHandle(ev);
+            }
         }
     }
 
@@ -229,6 +272,8 @@ mod win {
     pub struct InputState {
         buttons: u8,
         shift: bool,
+        ctrl: bool,
+        alt: bool,
     }
 
     impl InputState {
@@ -258,6 +303,12 @@ mod win {
         }
 
         pub fn key(&mut self, down: bool, keysym: u32) {
+            match keysym {
+                0xffe3 | 0xffe4 => self.ctrl = down,
+                0xffe9 | 0xffea => self.alt = down,
+                0xffff if down && self.ctrl && self.alt => request_ctrl_alt_del(),
+                _ => {}
+            }
             let up = if down { 0 } else { KEYEVENTF_KEYUP };
             let named: Option<(u16, bool)> = match keysym {
                 0xff08 => Some((VK_BACK, false)),
@@ -356,6 +407,7 @@ fn pixels(frame: &[u8], w: usize, x0: usize, x1: usize, y0: usize, y1: usize, f:
 }
 
 fn sender(mut s: TcpStream, cs: Arc<Mutex<ClientState>>, alive: Arc<AtomicBool>, sh: Arc<Shared>) {
+    win::follow_input_desktop();
     let Some(mut grab) = win::Grabber::new() else {
         alive.store(false, Ordering::SeqCst);
         return;
@@ -364,6 +416,14 @@ fn sender(mut s: TcpStream, cs: Arc<Mutex<ClientState>>, alive: Arc<AtomicBool>,
     let mut last = vec![0u8; w * h * 4];
     let mut frame: Vec<u8> = Vec::new();
     while alive.load(Ordering::SeqCst) && sh.running.load(Ordering::SeqCst) {
+        if win::follow_input_desktop() {
+            // The screen switched (lock screen <-> desktop): grab from the new one.
+            match win::Grabber::new() {
+                Some(g) if g.w == w && g.h == h => grab = g,
+                _ => break,
+            }
+            last.fill(1);
+        }
         let (req, fmt) = {
             let g = cs.lock().unwrap();
             match &g.req {
@@ -495,7 +555,11 @@ fn client(mut s: TcpStream, sh: &Arc<Shared>) -> io::Result<()> {
             if !alive.load(Ordering::SeqCst) || !sh.running.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            match rd8(&mut s)? {
+            let kind = rd8(&mut s)?;
+            if kind == 4 || kind == 5 {
+                win::follow_input_desktop();
+            }
+            match kind {
                 0 => {
                     skip(&mut s, 3)?;
                     let bpp = rd8(&mut s)?;
@@ -590,6 +654,288 @@ fn serve(sh: Arc<Shared>) {
     }
 }
 
+// ---------------------------------------------------------------- the Windows service
+//
+// The service runs as SYSTEM in the background, so it starts with Windows before anyone logs in.
+// A service cannot see the screen itself, so it starts a copy of this program ("--helper") in the
+// session that is on the monitor. That copy follows the screen to the lock screen and back.
+
+mod svc {
+    use std::mem::{size_of, zeroed};
+    use std::ptr::null_mut;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows_sys::Win32::System::Services::*;
+    use windows_sys::Win32::System::Threading::*;
+
+    pub const NAME: &str = "SimpleVNC";
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static mut STATUS: SERVICE_STATUS_HANDLE = null_mut();
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn set_state(state: u32) {
+        let st = SERVICE_STATUS {
+            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: if state == SERVICE_RUNNING {
+                SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+            } else {
+                0
+            },
+            dwWin32ExitCode: 0,
+            dwServiceSpecificExitCode: 0,
+            dwCheckPoint: 0,
+            dwWaitHint: 3000,
+        };
+        unsafe {
+            SetServiceStatus(STATUS, &st);
+        }
+    }
+
+    unsafe extern "system" fn handler(ctrl: u32) {
+        if ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN {
+            STOP.store(true, Ordering::SeqCst);
+            set_state(SERVICE_STOP_PENDING);
+        }
+    }
+
+    unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core::PWSTR) {
+        let name = wide(NAME);
+        STATUS = RegisterServiceCtrlHandlerW(name.as_ptr(), Some(handler));
+        set_state(SERVICE_RUNNING);
+        supervise();
+        set_state(SERVICE_STOPPED);
+    }
+
+    pub fn run() {
+        let mut name = wide(NAME);
+        let table = [
+            SERVICE_TABLE_ENTRYW { lpServiceName: name.as_mut_ptr(), lpServiceProc: Some(service_main) },
+            SERVICE_TABLE_ENTRYW { lpServiceName: null_mut(), lpServiceProc: None },
+        ];
+        unsafe {
+            if StartServiceCtrlDispatcherW(table.as_ptr()) == 0 {
+                eprintln!("--service is only for Windows to use. Use --install instead.");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // Starts "--helper" as SYSTEM inside the session shown on the monitor.
+    fn launch(session: u32) -> HANDLE {
+        unsafe {
+            let (mut tok, mut dup) = (null_mut(), null_mut());
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut tok) == 0 {
+                return null_mut();
+            }
+            let ok = DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, null_mut(), SecurityImpersonation, TokenPrimary, &mut dup);
+            CloseHandle(tok);
+            if ok == 0 {
+                return null_mut();
+            }
+            SetTokenInformation(dup, TokenSessionId, &session as *const u32 as _, 4);
+            let exe = std::env::current_exe().unwrap_or_default();
+            let port = super::PORT.load(Ordering::SeqCst);
+            let mut cmd = wide(&format!("\"{}\" --helper --port {}", exe.display(), port));
+            let mut desktop = wide("winsta0\\default");
+            let mut si: STARTUPINFOW = zeroed();
+            si.cb = size_of::<STARTUPINFOW>() as u32;
+            si.lpDesktop = desktop.as_mut_ptr();
+            let mut pi: PROCESS_INFORMATION = zeroed();
+            let ok = CreateProcessAsUserW(
+                dup,
+                null_mut(),
+                cmd.as_mut_ptr(),
+                null_mut(),
+                null_mut(),
+                0,
+                CREATE_NO_WINDOW,
+                null_mut(),
+                null_mut(),
+                &si,
+                &mut pi,
+            );
+            CloseHandle(dup);
+            if ok == 0 {
+                return null_mut();
+            }
+            CloseHandle(pi.hThread);
+            pi.hProcess
+        }
+    }
+
+    fn send_ctrl_alt_del() {
+        unsafe {
+            let lib = LoadLibraryW(wide("sas.dll").as_ptr());
+            if lib.is_null() {
+                return;
+            }
+            if let Some(f) = GetProcAddress(lib, b"SendSAS\0".as_ptr()) {
+                let send_sas: unsafe extern "system" fn(i32) = std::mem::transmute(f);
+                send_sas(0);
+            }
+        }
+    }
+
+    fn supervise() {
+        unsafe {
+            let sas = CreateEventW(null_mut(), 0, 0, wide("Global\\SimpleVncSAS").as_ptr());
+            let (mut child, mut child_session): (HANDLE, u32) = (null_mut(), u32::MAX);
+            while !STOP.load(Ordering::SeqCst) {
+                let session = WTSGetActiveConsoleSessionId();
+                if !child.is_null() {
+                    let mut code = 0u32;
+                    GetExitCodeProcess(child, &mut code);
+                    if code != STILL_ACTIVE as u32 || session != child_session {
+                        TerminateProcess(child, 0);
+                        CloseHandle(child);
+                        child = null_mut();
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+                if child.is_null() && session != u32::MAX {
+                    child = launch(session);
+                    child_session = session;
+                }
+                if !sas.is_null() && WaitForSingleObject(sas, 1000) == WAIT_OBJECT_0 {
+                    send_ctrl_alt_del();
+                } else if sas.is_null() {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            if !child.is_null() {
+                TerminateProcess(child, 0);
+                CloseHandle(child);
+            }
+        }
+    }
+
+    pub fn is_admin() -> bool {
+        unsafe {
+            let mut tok = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+                return false;
+            }
+            let mut elevated = 0u32;
+            let mut len = 0u32;
+            GetTokenInformation(tok, TokenElevation, &mut elevated as *mut u32 as _, 4, &mut len);
+            CloseHandle(tok);
+            elevated != 0
+        }
+    }
+}
+
+// Runs a Windows command line as written (keeps the quotes we put in).
+fn run_cmd(line: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .raw_arg(format!("/c {} >nul 2>&1", line))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// Re-opens this program as administrator (Windows asks "Yes / No") and waits for it.
+fn run_as_admin(args: &str) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let ps = format!(
+        "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait",
+        exe.display().to_string().replace('\'', "''"),
+        args
+    );
+    let ok = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Windows did not allow it. Press Yes when Windows asks.");
+        std::process::exit(1);
+    }
+}
+
+fn install(port: u16) {
+    if !svc::is_admin() {
+        println!("Asking Windows for permission (press Yes)...");
+        run_as_admin(&format!("--install --port {} --pause", port));
+        return;
+    }
+    let dir = std::path::PathBuf::from(std::env::var("ProgramFiles").unwrap_or("C:\\Program Files".into()))
+        .join("Simple VNC");
+    let target = dir.join("simple-vnc-server.exe");
+    run_cmd(&format!("sc stop {}", svc::NAME));
+    std::thread::sleep(Duration::from_secs(2));
+    let me = std::env::current_exe().unwrap_or_default();
+    let copied = std::fs::create_dir_all(&dir).is_ok()
+        && (me == target || std::fs::copy(&me, &target).is_ok());
+    if !copied {
+        eprintln!("Could not copy the program to {}.", dir.display());
+        return;
+    }
+    let bin = format!("\"\\\"{}\\\" --service --port {}\"", target.display(), port);
+    let made = run_cmd(&format!(
+        "sc create {} binPath= {} start= auto DisplayName= \"Simple VNC Server\"",
+        svc::NAME, bin
+    )) || run_cmd(&format!("sc config {} binPath= {} start= auto", svc::NAME, bin));
+    if !made {
+        eprintln!("Could not register the background service.");
+        return;
+    }
+    run_cmd(&format!(
+        "sc description {} \"Shares this screen over VNC, also before login.\"",
+        svc::NAME
+    ));
+    run_cmd(&format!("sc failure {} reset= 60 actions= restart/5000", svc::NAME));
+    run_cmd(&format!(
+        "netsh advfirewall firewall delete rule name=\"Simple VNC Server {}\"",
+        port
+    ));
+    run_cmd(&format!(
+        "netsh advfirewall firewall add rule name=\"Simple VNC Server {0}\" dir=in action=allow protocol=TCP localport={0} profile=any",
+        port
+    ));
+    // Lets the service press the real Ctrl+Alt+Del for the viewer's button.
+    run_cmd("reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v SoftwareSASGeneration /t REG_DWORD /d 1 /f");
+    if run_cmd(&format!("sc start {}", svc::NAME)) {
+        println!("Done. Simple VNC Server now starts with Windows, also before login.");
+        println!("This computer's address: {}", local_ip());
+        println!("To remove it: simple-vnc-server --uninstall");
+    } else {
+        eprintln!("Installed, but the service did not start. Restart the computer and try again.");
+    }
+}
+
+fn uninstall() {
+    if !svc::is_admin() {
+        println!("Asking Windows for permission (press Yes)...");
+        run_as_admin("--uninstall --pause");
+        return;
+    }
+    run_cmd(&format!("sc stop {}", svc::NAME));
+    std::thread::sleep(Duration::from_secs(2));
+    let removed = run_cmd(&format!("sc delete {}", svc::NAME));
+    for port in [5900u16, PORT.load(Ordering::SeqCst)] {
+        run_cmd(&format!(
+            "netsh advfirewall firewall delete rule name=\"Simple VNC Server {}\"",
+            port
+        ));
+    }
+    let dir = std::path::PathBuf::from(std::env::var("ProgramFiles").unwrap_or("C:\\Program Files".into()))
+        .join("Simple VNC");
+    let _ = std::fs::remove_dir_all(dir);
+    if removed {
+        println!("Removed. Simple VNC Server no longer starts with Windows.");
+    } else {
+        println!("Simple VNC Server was not installed as a service.");
+    }
+}
+
 // ---------------------------------------------------------------- the terminal
 
 fn local_ip() -> String {
@@ -606,10 +952,20 @@ const HELP: &str = "Simple VNC Server
 Usage:
   simple-vnc-server                 start sharing this screen
   simple-vnc-server --port 5901     share on another port (default 5900)
+  simple-vnc-server --install       start with Windows, also before login (asks for admin)
+  simple-vnc-server --uninstall     stop starting with Windows
   simple-vnc-server --help          show this help
 
 Press Ctrl+C to stop sharing.
 ";
+
+enum Mode {
+    Terminal,
+    Install,
+    Uninstall,
+    Service,
+    Helper,
+}
 
 fn main() {
     win::make_dpi_aware();
@@ -618,9 +974,16 @@ fn main() {
         print!("{}", HELP);
         return;
     }
+    let mut mode = Mode::Terminal;
+    let mut pause = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--install" => mode = Mode::Install,
+            "--uninstall" => mode = Mode::Uninstall,
+            "--service" => mode = Mode::Service,
+            "--helper" => mode = Mode::Helper,
+            "--pause" => pause = true,
             "--port" => match it.next().and_then(|v| v.parse::<u16>().ok()).filter(|p| *p > 0) {
                 Some(p) => PORT.store(p, Ordering::SeqCst),
                 None => {
@@ -635,12 +998,30 @@ fn main() {
         }
     }
 
+    let port = PORT.load(Ordering::SeqCst);
     let shared = Arc::new(Shared {
         running: AtomicBool::new(true),
         viewers: AtomicUsize::new(0),
         error: Mutex::new(String::new()),
     });
-    let port = PORT.load(Ordering::SeqCst);
+    match mode {
+        Mode::Terminal => {}
+        Mode::Install | Mode::Uninstall => {
+            if matches!(mode, Mode::Install) {
+                install(port);
+            } else {
+                uninstall();
+            }
+            if pause {
+                println!("\nPress Enter to close this window.");
+                let _ = io::stdin().read_line(&mut String::new());
+            }
+            return;
+        }
+        Mode::Service => return svc::run(),
+        Mode::Helper => return serve(shared),
+    }
+
     let ip = local_ip();
     let shown = if port == 5900 { ip } else { format!("{}:{}", ip, port) };
     println!("Simple VNC Server");
